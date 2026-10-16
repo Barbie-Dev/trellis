@@ -1091,10 +1091,15 @@ impl TrellisContract {
     /// milestone's state, not by who calls.
     ///
     /// Covered stalled states, once `env.ledger().timestamp() > deadline`:
-    /// - `Pending` (never funded) → `Refunded`. No tokens move; this is the
-    ///   automatic equivalent of [`Self::cancel_unfunded_milestone`].
+    /// - `Pending` (never funded) → `Cancelled`. No tokens move; this is the
+    ///   automatic equivalent of [`Self::cancel_unfunded_milestone`], and
+    ///   writes the same status it does.
     /// - `Funded` (payee never submitted work) → `Refunded`, and the locked
     ///   `amount` is returned to the payer.
+    ///
+    /// The split mirrors the rest of the contract: `Refunded` always means
+    /// escrowed tokens really went back to the payer, while `Cancelled` marks a
+    /// milestone that was closed before anything was ever locked.
     ///
     /// Deliberately **not** covered:
     /// - `WorkSubmitted` — the payee has delivered, so an unresponsive payer
@@ -1102,7 +1107,7 @@ impl TrellisContract {
     ///   [`Self::raise_dispute`].
     /// - `Disputed` — the resolver owns the outcome; a timeout would let
     ///   either party run out the clock on arbitration.
-    /// - `Completed` / `Refunded` — already terminal.
+    /// - `Completed` / `Refunded` / `Cancelled` — already terminal.
     ///
     /// All of these return [`TrellisError::InvalidStateTransition`].
     ///
@@ -1133,15 +1138,18 @@ impl TrellisContract {
             _ => return Err(TrellisError::DeadlineNotReached),
         }
 
-        let refunded_amount = match milestone.status {
-            EscrowStatus::Pending => 0,
-            EscrowStatus::Funded => milestone.amount,
+        // A never-funded milestone is `Cancelled` (no tokens moved), exactly as
+        // `cancel_unfunded_milestone` would leave it; `Refunded` is reserved
+        // for the case where escrowed funds really go back to the payer.
+        let (refunded_amount, new_status) = match milestone.status {
+            EscrowStatus::Pending => (0, EscrowStatus::Cancelled),
+            EscrowStatus::Funded => (milestone.amount, EscrowStatus::Refunded),
             _ => return Err(TrellisError::InvalidStateTransition),
         };
 
         // Checks-effects-interactions: persist the terminal state before any
         // token transfer.
-        milestone.status = EscrowStatus::Refunded;
+        milestone.status = new_status;
         agreement.milestones.set(milestone_id, milestone);
         storage::write_agreement(&env, &agreement_id, &agreement)?;
 

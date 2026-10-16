@@ -491,7 +491,7 @@ Trellis is a monorepo with three layers:
 | `extend_agreement_ttl` | Anyone | Renews an agreement's ledger TTL to avoid archival |
 | `set_milestone_deadline` | Payer | Sets an optional deadline (ledger timestamp) on a still-`Pending` milestone |
 | `get_milestone_deadline` | Anyone | Returns a milestone's deadline, if one is set (read-only) |
-| `expire_milestone` | Anyone | After the deadline, closes a stalled `Pending` or `Funded` milestone as `Refunded`, returning any locked funds to the payer |
+| `expire_milestone` | Anyone | After the deadline, closes a stalled milestone: a never-funded `Pending` one becomes `Cancelled`, a `Funded` one becomes `Refunded` with the locked funds returned to the payer |
 
 <details>
 <summary>🧬 <strong>Native ScVal Encoding</strong></summary>

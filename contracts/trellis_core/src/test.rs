@@ -2176,7 +2176,8 @@ fn test_set_milestone_deadline_wrong_role_fails() {
 }
 
 /// Unfunded milestone past its deadline: a third-party keeper can close it
-/// as `Refunded` with no token movement.
+/// as `Cancelled` (not `Refunded`) with no token movement — the same status
+/// `cancel_unfunded_milestone` writes, since nothing was ever escrowed.
 #[test]
 fn test_expire_unfunded_milestone_after_deadline() {
     let (env, payer, payee, dispute_resolver, token_address, client) = setup();
@@ -2203,9 +2204,15 @@ fn test_expire_unfunded_milestone_after_deadline() {
 
     assert_eq!(
         client.get_milestone(&id, &0u32).map(|m| m.status),
-        Some(EscrowStatus::Refunded)
+        Some(EscrowStatus::Cancelled),
+        "expiring a never-funded milestone must write Cancelled, not Refunded"
     );
     assert_eq!(token_client.balance(&payer), payer_balance);
+    // Terminal: it cannot be expired a second time.
+    assert_eq!(
+        client.try_expire_milestone(&keeper, &id, &0u32),
+        Err(Ok(TrellisError::InvalidStateTransition))
+    );
     // The milestone left `Pending`, so it can no longer be funded.
     assert_eq!(
         client.try_lock_funds(&id, &0u32),
@@ -2239,7 +2246,8 @@ fn test_expire_funded_milestone_refunds_payer() {
     assert_eq!(token_client.balance(&payee), 0);
     assert_eq!(
         client.get_milestone(&id, &0u32).map(|m| m.status),
-        Some(EscrowStatus::Refunded)
+        Some(EscrowStatus::Refunded),
+        "expiring a funded milestone returns real tokens, so it stays Refunded"
     );
     // Terminal: a second expiry cannot pay out twice.
     assert_eq!(

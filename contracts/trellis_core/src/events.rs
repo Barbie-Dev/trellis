@@ -302,8 +302,9 @@ pub fn deadline_set(env: &Env, agreement_id: BytesN<32>, milestone_id: u32, dead
 /// Data:   `(milestone_id, refunded_amount, caller)`
 ///
 /// `refunded_amount` is `0` when the milestone expired while still `Pending`
-/// (nothing was ever escrowed), and the milestone amount when it expired
-/// while `Funded` (the locked funds went back to the payer). `caller` is
+/// (nothing was ever escrowed; it is now `Cancelled`), and the milestone
+/// amount when it expired while `Funded` (the locked funds went back to the
+/// payer; it is now `Refunded`). `caller` is
 /// whoever triggered the expiry — the entrypoint is permissionless, so this
 /// may be a keeper rather than either party.
 pub fn milestone_expired(
