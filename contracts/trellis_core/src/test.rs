@@ -1677,9 +1677,9 @@ fn test_extend_ttl_success() {
         &dispute_resolver,
     );
 
-    // extend_agreement_ttl has no require_auth() gate — it's a permissionless
-    // keeper entrypoint — so no auth mock is needed here. It reports the
-    // keeper address in `ttl_extended`, so pass the caller explicitly.
+    // extend_agreement_ttl is permissionless but authenticates `caller`, which
+    // the blanket auth mock from `setup` satisfies. It reports the keeper
+    // address in `ttl_extended`, so pass the caller explicitly.
     let result = client.try_extend_agreement_ttl(&id, &payer);
     assert_eq!(
         result,
@@ -1694,7 +1694,7 @@ fn test_extend_ttl_nonexistent_agreement() {
     let (env, payer, _payee, _dispute_resolver, _token_address, client) = setup();
     let id = agreement_id(&env, 99);
 
-    // No auth mock needed — see comment above test_extend_ttl_success.
+    // `caller` auth is satisfied by the blanket mock from `setup`.
     let result = client.try_extend_agreement_ttl(&id, &payer);
     assert_eq!(
         result,
@@ -3278,4 +3278,57 @@ fn test_resolve_dispute_with_open_milestones_does_not_complete_agreement() {
         &[symbol_short!("trls_rslv")],
         "milestone 1 is still Pending, so only trls_rslv may fire",
     );
+}
+
+// ---------------------------------------------------------------------------
+// #607 — extend_agreement_ttl authenticates the caller it records
+// ---------------------------------------------------------------------------
+
+/// Without `caller`'s authorisation the call traps, so nobody can log an
+/// arbitrary address as the keeper in `trls_ttle`.
+#[test]
+#[should_panic(expected = "InvalidAction")]
+fn test_extend_ttl_without_caller_auth_traps() {
+    let (env, payer, payee, dispute_resolver, token_address, client) = setup();
+    let id = agreement_id(&env, 220);
+    client.init(
+        &id,
+        &payer,
+        &payee,
+        &token_address,
+        &one_milestone(&env, 1_000),
+        &dispute_resolver,
+    );
+    let keeper = Address::generate(&env);
+
+    deny_all_auth(&env);
+    client.extend_agreement_ttl(&id, &keeper);
+}
+
+/// A third-party keeper can still renew any agreement, and the only signature
+/// the call requires is the keeper's own — which is exactly the address the
+/// `trls_ttle` event then reports.
+#[test]
+fn test_extend_ttl_requires_only_caller_signature() {
+    let (env, payer, payee, dispute_resolver, token_address, client) = setup();
+    let id = agreement_id(&env, 221);
+    client.init(
+        &id,
+        &payer,
+        &payee,
+        &token_address,
+        &one_milestone(&env, 1_000),
+        &dispute_resolver,
+    );
+    let keeper = Address::generate(&env);
+
+    client.extend_agreement_ttl(&id, &keeper);
+
+    let auths = env.auths();
+    assert_eq!(auths.len(), 1, "only the caller may be asked to sign");
+    assert_eq!(auths[0].0, keeper, "the required signer must be `caller`");
+
+    let (logged,): (Address,) =
+        trellis_event_data(&env, &client.address, symbol_short!("trls_ttle"));
+    assert_eq!(logged, keeper, "trls_ttle must name the real signer");
 }

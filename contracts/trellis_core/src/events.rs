@@ -272,7 +272,9 @@ pub fn agreement_completed(
 /// Emitted when a keeper extends the TTL of an agreement to prevent expiry.
 ///
 /// No state is modified beyond the ledger TTL. This event creates an audit
-/// trail for off-chain monitoring of keeper activity.
+/// trail for off-chain monitoring of keeper activity. `caller` has authorised
+/// the invocation (`extend_agreement_ttl` calls `caller.require_auth()`), so
+/// it is always the real signer and cannot be forged.
 ///
 /// Topics: `("trls_ttle", agreement_id)`
 /// Data:   `(caller)`

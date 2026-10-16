@@ -1002,9 +1002,14 @@ impl TrellisContract {
     /// expire. This entrypoint exists so an external keeper service can renew
     /// it on a schedule.
     ///
-    /// No auth is required: extending a TTL cannot alter agreement state and
-    /// the caller pays the rent, so there is nothing to gate. Requiring a
-    /// signature would only stop third-party keepers from doing useful work.
+    /// Still permissionless — any address, including a third-party keeper,
+    /// may renew any agreement — but `caller` must authorise its own call
+    /// (`caller.require_auth()`). `caller` is published in the `ttl_extended`
+    /// event as an audit trail of keeper activity, so without the check anyone
+    /// could log an arbitrary address as the keeper. A keeper already signs
+    /// the transaction it submits, so this costs it nothing, and it matches
+    /// [`Self::expire_milestone`], which authenticates its `caller` for the
+    /// same reason.
     ///
     /// # Errors
     /// - [`TrellisError::AgreementNotFound`] – unknown agreement ID.
@@ -1013,6 +1018,10 @@ impl TrellisContract {
         agreement_id: BytesN<32>,
         caller: Address,
     ) -> Result<(), TrellisError> {
+        // Authenticate before the TTL bump so the emitted `caller` is
+        // guaranteed to be the real signer.
+        caller.require_auth();
+
         storage::extend_agreement_ttl(&env, &agreement_id)?;
         events::ttl_extended(&env, agreement_id, caller);
         Ok(())
