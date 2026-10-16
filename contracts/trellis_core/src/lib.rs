@@ -190,12 +190,17 @@ impl TrellisContract {
     /// `agreement.token`.
     ///
     /// The milestone must be `Pending`; any other status returns
-    /// [`TrellisError::InvalidStateTransition`].
+    /// [`TrellisError::InvalidStateTransition`]. If a deadline was set via
+    /// [`Self::set_milestone_deadline`] it must not have passed yet: funding a
+    /// milestone that is already expirable would let anyone call
+    /// [`Self::expire_milestone`] and pull the escrow straight back.
     ///
     /// # Errors
     /// - [`TrellisError::AgreementNotFound`] – unknown agreement ID.
     /// - [`TrellisError::InvalidMilestone`] – `milestone_id` out of range.
     /// - [`TrellisError::InvalidStateTransition`] – milestone not `Pending`.
+    /// - [`TrellisError::DeadlinePassed`] – the milestone's deadline is
+    ///   strictly before the current ledger timestamp.
     pub fn lock_funds(
         env: Env,
         agreement_id: BytesN<32>,
@@ -214,6 +219,7 @@ impl TrellisContract {
         if milestone.status != EscrowStatus::Pending {
             return Err(TrellisError::InvalidStateTransition);
         }
+        ensure_deadline_not_passed(&env, &agreement_id, milestone_id)?;
 
         // Mutate the milestone value and persist it back to storage before any
         // external calls (checks-effects-interactions pattern).
@@ -905,6 +911,8 @@ impl TrellisContract {
     /// - [`TrellisError::AgreementNotFound`] – unknown agreement ID.
     /// - [`TrellisError::InvalidMilestone`] – any ID in `milestone_ids` is out of range.
     /// - [`TrellisError::InvalidStateTransition`] – any milestone is not `Pending`.
+    /// - [`TrellisError::DeadlinePassed`] – any milestone's deadline has
+    ///   already passed (see [`Self::lock_funds`]).
     pub fn batch_lock_funds(
         env: Env,
         agreement_id: BytesN<32>,
@@ -942,6 +950,7 @@ impl TrellisContract {
             if milestone.status != EscrowStatus::Pending {
                 return Err(TrellisError::InvalidStateTransition);
             }
+            ensure_deadline_not_passed(&env, &agreement_id, milestone_id)?;
 
             let amount = milestone.amount;
             milestone.status = EscrowStatus::Funded;
@@ -1188,6 +1197,25 @@ impl TrellisContract {
 /// vector just to learn one number.
 fn remaining_amount(header: &AgreementHeader, milestone_id: u32, milestone: &Milestone) -> i128 {
     milestone.amount - header.released_amounts.get(milestone_id).unwrap_or(0)
+}
+
+/// Reject funding a milestone whose deadline has already passed.
+///
+/// Shared by `lock_funds` and `batch_lock_funds`. Uses the same boundary as
+/// `expire_milestone` (`timestamp > deadline`), so a milestone is fundable
+/// exactly as long as it is not yet expirable. A milestone with no deadline is
+/// always fundable.
+fn ensure_deadline_not_passed(
+    env: &Env,
+    agreement_id: &BytesN<32>,
+    milestone_id: u32,
+) -> Result<(), TrellisError> {
+    match storage::read_deadline(env, agreement_id, milestone_id) {
+        Some(deadline) if env.ledger().timestamp() > deadline => {
+            Err(TrellisError::DeadlinePassed)
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Emit `agreement_completed` if every milestone is now in a terminal state

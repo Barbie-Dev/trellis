@@ -3332,3 +3332,120 @@ fn test_extend_ttl_requires_only_caller_signature() {
         trellis_event_data(&env, &client.address, symbol_short!("trls_ttle"));
     assert_eq!(logged, keeper, "trls_ttle must name the real signer");
 }
+
+// ---------------------------------------------------------------------------
+// #608 — funding is rejected once the milestone deadline has passed
+// ---------------------------------------------------------------------------
+
+/// `lock_funds` exactly at the deadline still succeeds — the milestone is not
+/// expirable until the timestamp is strictly past it.
+#[test]
+fn test_lock_funds_at_deadline_succeeds() {
+    let (env, payer, payee, dispute_resolver, token_address, client) = setup();
+    let id = init_with_deadline(
+        &env,
+        &client,
+        230,
+        (&payer, &payee, &dispute_resolver, &token_address),
+        500,
+        100,
+    );
+
+    env.ledger().set_timestamp(DEADLINE_T0 + 100);
+    assert_eq!(client.try_lock_funds(&id, &0u32), Ok(Ok(())));
+    assert_eq!(
+        client.get_milestone(&id, &0u32).map(|m| m.status),
+        Some(EscrowStatus::Funded)
+    );
+}
+
+/// One second past the deadline, `lock_funds` returns `DeadlinePassed` and
+/// leaves the milestone `Pending` with no tokens moved.
+#[test]
+fn test_lock_funds_after_deadline_fails() {
+    let (env, payer, payee, dispute_resolver, token_address, client) = setup();
+    let token_client = token::TokenClient::new(&env, &token_address);
+    let id = init_with_deadline(
+        &env,
+        &client,
+        231,
+        (&payer, &payee, &dispute_resolver, &token_address),
+        500,
+        100,
+    );
+    let payer_balance = token_client.balance(&payer);
+
+    env.ledger().set_timestamp(DEADLINE_T0 + 101);
+    assert_eq!(
+        client.try_lock_funds(&id, &0u32),
+        Err(Ok(TrellisError::DeadlinePassed))
+    );
+    assert_eq!(
+        client.get_milestone(&id, &0u32).map(|m| m.status),
+        Some(EscrowStatus::Pending)
+    );
+    assert_eq!(token_client.balance(&payer), payer_balance);
+    assert_eq!(token_client.balance(&client.address), 0);
+}
+
+/// `batch_lock_funds` exactly at the deadline still succeeds.
+#[test]
+fn test_batch_lock_funds_at_deadline_succeeds() {
+    let (env, payer, payee, dispute_resolver, token_address, client) = setup();
+    let id = init_with_deadline(
+        &env,
+        &client,
+        232,
+        (&payer, &payee, &dispute_resolver, &token_address),
+        500,
+        100,
+    );
+
+    env.ledger().set_timestamp(DEADLINE_T0 + 100);
+    assert_eq!(
+        client.try_batch_lock_funds(&id, &vec![&env, 0u32]),
+        Ok(Ok(1u32))
+    );
+    assert_eq!(
+        client.get_milestone(&id, &0u32).map(|m| m.status),
+        Some(EscrowStatus::Funded)
+    );
+}
+
+/// `batch_lock_funds` past a milestone's deadline returns `DeadlinePassed` and
+/// reverts the whole batch, including milestones without a deadline.
+#[test]
+fn test_batch_lock_funds_after_deadline_fails_atomically() {
+    let (env, payer, payee, dispute_resolver, token_address, client) = setup();
+    let token_client = token::TokenClient::new(&env, &token_address);
+    env.ledger().set_timestamp(DEADLINE_T0);
+    let id = agreement_id(&env, 233);
+    client.init(
+        &id,
+        &payer,
+        &payee,
+        &token_address,
+        &crate::test_utils::milestones_from_amounts(&env, &[500, 700]),
+        &dispute_resolver,
+    );
+    // Only milestone 1 has a deadline.
+    client.set_milestone_deadline(&id, &1u32, &(DEADLINE_T0 + 100));
+    let payer_balance = token_client.balance(&payer);
+
+    env.ledger().set_timestamp(DEADLINE_T0 + 101);
+    assert_eq!(
+        client.try_batch_lock_funds(&id, &vec![&env, 0u32, 1u32]),
+        Err(Ok(TrellisError::DeadlinePassed))
+    );
+    assert_eq!(
+        client.get_milestone(&id, &0u32).map(|m| m.status),
+        Some(EscrowStatus::Pending),
+        "the failed batch must not fund the milestone without a deadline either"
+    );
+    assert_eq!(
+        client.get_milestone(&id, &1u32).map(|m| m.status),
+        Some(EscrowStatus::Pending)
+    );
+    assert_eq!(token_client.balance(&payer), payer_balance);
+    assert_eq!(token_client.balance(&client.address), 0);
+}
