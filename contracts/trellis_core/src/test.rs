@@ -3111,3 +3111,163 @@ fn test_rotate_resolver_preserves_escrow_and_release_state() {
         "rotation must not move the payer's remaining balance"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #605 — dispute rulings that settle the last milestone complete the agreement
+// ---------------------------------------------------------------------------
+
+/// Init a two-milestone agreement, settle milestone 0 by normal approval, and
+/// leave milestone 1 `Disputed` — so the next ruling on it is the transition
+/// that settles the whole agreement.
+fn init_with_last_milestone_disputed(
+    env: &Env,
+    client: &TrellisContractClient,
+    seed: u8,
+    parties: (&Address, &Address, &Address, &Address),
+) -> BytesN<32> {
+    let (payer, payee, dispute_resolver, token_address) = parties;
+    let id = agreement_id(env, seed);
+    client.init(
+        &id,
+        payer,
+        payee,
+        token_address,
+        &crate::test_utils::milestones_from_amounts(env, &[1_000, 2_000]),
+        dispute_resolver,
+    );
+
+    client.lock_funds(&id, &0u32);
+    client.submit_work(&id, &0u32, &None);
+    client.approve_and_release(&id, &0u32);
+
+    client.lock_funds(&id, &1u32);
+    client.raise_dispute(payee, &id, &1u32, &None);
+    id
+}
+
+/// `resolve_dispute(refund_to_payer = true)` on the last open milestone emits
+/// `trls_rslv` then `trls_cmpl`, counting the ruling as a refund.
+#[test]
+fn test_resolve_dispute_refund_on_last_milestone_completes_agreement() {
+    let (env, payer, payee, dispute_resolver, token_address, client) = setup();
+    let id = init_with_last_milestone_disputed(
+        &env,
+        &client,
+        210,
+        (&payer, &payee, &dispute_resolver, &token_address),
+    );
+
+    client.resolve_dispute(&id, &1u32, &true);
+
+    assert_trellis_topics(
+        &env,
+        &client.address,
+        &[symbol_short!("trls_rslv"), symbol_short!("trls_cmpl")],
+        "resolve_dispute on the last milestone must emit trls_rslv then trls_cmpl",
+    );
+    let counts: (u32, u32) =
+        trellis_event_data(&env, &client.address, symbol_short!("trls_cmpl"));
+    assert_eq!(counts, (1, 1), "one approved, one refunded by ruling");
+}
+
+/// `resolve_dispute(refund_to_payer = false)` on the last open milestone
+/// completes the agreement with both milestones counted as completed.
+#[test]
+fn test_resolve_dispute_award_on_last_milestone_completes_agreement() {
+    let (env, payer, payee, dispute_resolver, token_address, client) = setup();
+    let id = init_with_last_milestone_disputed(
+        &env,
+        &client,
+        211,
+        (&payer, &payee, &dispute_resolver, &token_address),
+    );
+
+    client.resolve_dispute(&id, &1u32, &false);
+
+    assert_trellis_topics(
+        &env,
+        &client.address,
+        &[symbol_short!("trls_rslv"), symbol_short!("trls_cmpl")],
+        "resolve_dispute on the last milestone must emit trls_rslv then trls_cmpl",
+    );
+    let counts: (u32, u32) =
+        trellis_event_data(&env, &client.address, symbol_short!("trls_cmpl"));
+    assert_eq!(counts, (2, 0), "both milestones paid to the payee");
+}
+
+/// A genuine split on the last open milestone completes the agreement; the
+/// split's status is `Completed`, so it counts towards `completed_count`.
+#[test]
+fn test_resolve_dispute_split_on_last_milestone_completes_agreement() {
+    let (env, payer, payee, dispute_resolver, token_address, client) = setup();
+    let id = init_with_last_milestone_disputed(
+        &env,
+        &client,
+        212,
+        (&payer, &payee, &dispute_resolver, &token_address),
+    );
+
+    client.resolve_dispute_split(&id, &1u32, &500i128, &1_500i128);
+
+    assert_trellis_topics(
+        &env,
+        &client.address,
+        &[symbol_short!("trls_rslv"), symbol_short!("trls_cmpl")],
+        "resolve_dispute_split on the last milestone must emit trls_rslv then trls_cmpl",
+    );
+    let counts: (u32, u32) =
+        trellis_event_data(&env, &client.address, symbol_short!("trls_cmpl"));
+    assert_eq!(counts, (2, 0), "a split ruling is recorded as Completed");
+}
+
+/// A 100/0 split on the last open milestone completes the agreement with the
+/// ruling counted as a refund.
+#[test]
+fn test_resolve_dispute_split_full_refund_on_last_milestone_completes_agreement() {
+    let (env, payer, payee, dispute_resolver, token_address, client) = setup();
+    let id = init_with_last_milestone_disputed(
+        &env,
+        &client,
+        213,
+        (&payer, &payee, &dispute_resolver, &token_address),
+    );
+
+    client.resolve_dispute_split(&id, &1u32, &2_000i128, &0i128);
+
+    assert_trellis_topics(
+        &env,
+        &client.address,
+        &[symbol_short!("trls_rslv"), symbol_short!("trls_cmpl")],
+        "resolve_dispute_split on the last milestone must emit trls_rslv then trls_cmpl",
+    );
+    let counts: (u32, u32) =
+        trellis_event_data(&env, &client.address, symbol_short!("trls_cmpl"));
+    assert_eq!(counts, (1, 1), "one approved, one refunded by ruling");
+}
+
+/// A ruling that leaves another milestone open must not complete the
+/// agreement.
+#[test]
+fn test_resolve_dispute_with_open_milestones_does_not_complete_agreement() {
+    let (env, payer, payee, dispute_resolver, token_address, client) = setup();
+    let id = agreement_id(&env, 214);
+    client.init(
+        &id,
+        &payer,
+        &payee,
+        &token_address,
+        &crate::test_utils::milestones_from_amounts(&env, &[1_000, 2_000]),
+        &dispute_resolver,
+    );
+    client.lock_funds(&id, &0u32);
+    client.raise_dispute(&payer, &id, &0u32, &None);
+
+    client.resolve_dispute(&id, &0u32, &true);
+
+    assert_trellis_topics(
+        &env,
+        &client.address,
+        &[symbol_short!("trls_rslv")],
+        "milestone 1 is still Pending, so only trls_rslv may fire",
+    );
+}

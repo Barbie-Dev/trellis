@@ -497,6 +497,9 @@ impl TrellisContract {
     /// funds is accounted for exactly once. Passing the whole remainder to one
     /// side reproduces [`Self::resolve_dispute`]'s all-or-nothing behaviour.
     ///
+    /// If this ruling settles the agreement's last non-terminal milestone,
+    /// `agreement_completed` is emitted after `milestone_resolved`.
+    ///
     /// # Auth
     /// `agreement.dispute_resolver.require_auth()` — see
     /// [`Self::resolve_dispute`] for why that alone is sufficient.
@@ -576,7 +579,22 @@ impl TrellisContract {
             );
         }
 
-        events::milestone_resolved(&env, agreement_id, milestone_id, payer_amount, payee_amount);
+        events::milestone_resolved(
+            &env,
+            agreement_id.clone(),
+            milestone_id,
+            payer_amount,
+            payee_amount,
+        );
+        // A ruling moves the milestone into a terminal state, so it can be the
+        // transition that settles the whole agreement — mirror
+        // `approve_and_release` and emit `agreement_completed` after the
+        // milestone-level event.
+        emit_if_agreement_completed(
+            &env,
+            &agreement_id,
+            &storage::read_agreement(&env, &agreement_id)?,
+        );
 
         Ok(())
     }
@@ -592,6 +610,9 @@ impl TrellisContract {
     /// `trellis resolve --refund-to-payer <bool>`, which is why its name and
     /// arguments must not change. For a genuine partial outcome use
     /// [`Self::resolve_dispute_split`], which expresses what this one cannot.
+    ///
+    /// If this ruling settles the agreement's last non-terminal milestone,
+    /// `agreement_completed` is emitted after `milestone_resolved`.
     ///
     /// # Auth
     /// `agreement.dispute_resolver.require_auth()` is the sole enforcement
@@ -647,10 +668,17 @@ impl TrellisContract {
         // one leg is the full remainder, the other is zero.
         events::milestone_resolved(
             &env,
-            agreement_id,
+            agreement_id.clone(),
             milestone_id,
             if refund_to_payer { amount } else { 0 },
             if refund_to_payer { 0 } else { amount },
+        );
+        // See `resolve_dispute_split`: a ruling can settle the last
+        // non-terminal milestone, so check for agreement completion.
+        emit_if_agreement_completed(
+            &env,
+            &agreement_id,
+            &storage::read_agreement(&env, &agreement_id)?,
         );
 
         Ok(())
