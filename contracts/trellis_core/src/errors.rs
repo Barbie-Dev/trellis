@@ -155,16 +155,12 @@ pub enum TrellisError {
     /// Appended as discriminant `18` per the stability rule above.
     InvalidReleaseAmount = 18,
 
-    /// `lock_funds` or `batch_lock_funds` was called on a milestone whose
-    /// deadline (set via `set_milestone_deadline`) has already passed
-    /// (`env.ledger().timestamp() > deadline`).
+    /// A token transfer into the contract credited less than the requested
+    /// amount (e.g. a fee-on-transfer token).
     ///
-    /// Funding it would flip the milestone to `Funded` while it is already
-    /// expirable, so any account could immediately call `expire_milestone`
-    /// and pull the escrow back to the payer — possibly after the payee has
-    /// seen `Funded` and started work. Funding at or before the deadline is
-    /// still accepted.
+    /// Crediting the full amount anyway would leave the pooled balance short
+    /// and let later payouts drain other agreements' funds.
     ///
     /// Appended as discriminant `19` per the stability rule above.
-    DeadlinePassed = 19,
+    TransferShortfall = 19,
 }

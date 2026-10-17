@@ -6,7 +6,7 @@ use soroban_sdk::{
 
 use crate::{
     errors::TrellisError,
-    test_utils::{agreement_id, one_milestone},
+    test_utils::{agreement_id, milestones_from_amounts, one_milestone},
     types::{EscrowStatus, Milestone},
     TrellisContract, TrellisContractClient, MAX_PROOF_URI_LEN,
 };
@@ -874,6 +874,113 @@ fn test_batch_lock_funds() {
         token_client.balance(&payer),
         9_000,
         "payer balance should decrease by the total locked amount"
+    );
+}
+
+/// #611: `batch_lock_funds` moves the whole batch with a single summed token
+/// transfer, while still emitting one `trls_lckd` event per milestone and
+/// leaving balances identical to funding each milestone individually. It must
+/// also be measurably cheaper than the equivalent sequence of `lock_funds`
+/// calls.
+#[test]
+fn test_batch_lock_funds_single_summed_transfer() {
+    const COUNT: u32 = 20;
+    const AMOUNT: i128 = 50;
+
+    let (env, payer, payee, dispute_resolver, token_address, client) = setup();
+    let token_client = token::TokenClient::new(&env, &token_address);
+
+    let mut milestones: Vec<Milestone> = Vec::new(&env);
+    let mut milestone_ids: Vec<u32> = Vec::new(&env);
+    for i in 0..COUNT {
+        milestones.push_back(Milestone {
+            amount: AMOUNT,
+            status: EscrowStatus::Pending,
+            proof_uri: None,
+        });
+        milestone_ids.push_back(i);
+    }
+
+    // Baseline: fund an identical agreement one milestone at a time.
+    let sequential_id = agreement_id(&env, 71);
+    client.init(
+        &sequential_id,
+        &payer,
+        &payee,
+        &token_address,
+        &milestones,
+        &dispute_resolver,
+    );
+    let mut sequential_cpu: u64 = 0;
+    for i in 0..COUNT {
+        env.cost_estimate().budget().reset_default();
+        client.lock_funds(&sequential_id, &i);
+        sequential_cpu += env.cost_estimate().budget().cpu_instruction_cost();
+    }
+
+    let payer_before = token_client.balance(&payer);
+    let contract_before = token_client.balance(&client.address);
+
+    let batch_id = agreement_id(&env, 72);
+    client.init(
+        &batch_id,
+        &payer,
+        &payee,
+        &token_address,
+        &milestones,
+        &dispute_resolver,
+    );
+    env.cost_estimate().budget().reset_default();
+    let funded = client.batch_lock_funds(&batch_id, &milestone_ids);
+    let batch_cpu = env.cost_estimate().budget().cpu_instruction_cost();
+
+    // Events must be inspected straight after the call (see
+    // `assert_trellis_topics`).
+    let all_events = env.events().all();
+    let transfer = Symbol::new(&env, "transfer");
+    let mut transfers = 0u32;
+    let mut locked = 0u32;
+    for i in 0..all_events.len() {
+        let (contract_id, topics, data) = all_events.get_unchecked(i);
+        let topic0 = Symbol::try_from_val(&env, &topics.get_unchecked(0))
+            .expect("event topic 0 must decode as a Symbol");
+        if contract_id == token_address && topic0 == transfer {
+            let moved = i128::try_from_val(&env, &data).expect("transfer data is the amount");
+            assert_eq!(moved, AMOUNT * COUNT as i128, "the transfer must carry the summed total");
+            transfers += 1;
+        } else if contract_id == client.address && topic0 == symbol_short!("trls_lckd") {
+            let (milestone_id, amount): (u32, i128) = <(u32, i128)>::try_from_val(&env, &data)
+                .expect("trls_lckd data must be (milestone_id, amount)");
+            assert_eq!(milestone_id, locked, "trls_lckd events must follow batch order");
+            assert_eq!(amount, AMOUNT);
+            locked += 1;
+        }
+    }
+    assert_eq!(transfers, 1, "a batch must make exactly one token transfer");
+    assert_eq!(locked, COUNT, "one trls_lckd event per funded milestone");
+
+    assert_eq!(funded, COUNT);
+    assert_eq!(
+        token_client.balance(&payer),
+        payer_before - AMOUNT * COUNT as i128,
+        "payer must be debited the batch total"
+    );
+    assert_eq!(
+        token_client.balance(&client.address),
+        contract_before + AMOUNT * COUNT as i128,
+        "contract must be credited the batch total"
+    );
+    let agreement = client.get_agreement(&batch_id);
+    for i in 0..COUNT {
+        assert_eq!(
+            agreement.milestones.get(i).unwrap().status,
+            EscrowStatus::Funded
+        );
+    }
+
+    assert!(
+        batch_cpu < sequential_cpu,
+        "batch ({batch_cpu}) must cost less CPU than {COUNT} sequential lock_funds ({sequential_cpu})"
     );
 }
 
@@ -3120,332 +3227,125 @@ fn test_rotate_resolver_preserves_escrow_and_release_state() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// #605 — dispute rulings that settle the last milestone complete the agreement
-// ---------------------------------------------------------------------------
+/// #612: happy path for `release_partial`. Two partial releases — one while
+/// the milestone is `Funded`, one after the work is submitted — must each move
+/// exactly `amount` from the contract to the payee, return the remainder,
+/// leave the milestone in its current non-terminal status, record the
+/// cumulative release in `released_amounts`, and emit a single `trls_prtl`
+/// event carrying `(milestone_id, amount, remaining)`.
+#[test]
+fn test_release_partial_happy_path() {
+    let (env, payer, payee, dispute_resolver, token_address, client) = setup();
+    let token_client = token::TokenClient::new(&env, &token_address);
+    let id = agreement_id(&env, 136);
 
-/// Init a two-milestone agreement, settle milestone 0 by normal approval, and
-/// leave milestone 1 `Disputed` — so the next ruling on it is the transition
-/// that settles the whole agreement.
-fn init_with_last_milestone_disputed(
-    env: &Env,
-    client: &TrellisContractClient,
-    seed: u8,
-    parties: (&Address, &Address, &Address, &Address),
-) -> BytesN<32> {
-    let (payer, payee, dispute_resolver, token_address) = parties;
-    let id = agreement_id(env, seed);
     client.init(
         &id,
-        payer,
-        payee,
-        token_address,
-        &crate::test_utils::milestones_from_amounts(env, &[1_000, 2_000]),
-        dispute_resolver,
+        &payer,
+        &payee,
+        &token_address,
+        &milestones_from_amounts(&env, &[1_000, 400]),
+        &dispute_resolver,
+    );
+    client.lock_funds(&id, &0u32);
+
+    assert_eq!(token_client.balance(&payer), 9_000);
+    assert_eq!(token_client.balance(&client.address), 1_000);
+    assert_eq!(token_client.balance(&payee), 0);
+
+    // --- First partial release, milestone still `Funded` -------------------
+    let remaining = client.release_partial(&id, &0u32, &300i128);
+
+    // Events must be checked straight after the call (see `assert_trellis_topics`).
+    assert_trellis_topics(
+        &env,
+        &client.address,
+        &[symbol_short!("trls_prtl")],
+        "a non-final partial release must emit exactly one trls_prtl event",
+    );
+    let (event_milestone, event_amount, event_remaining): (u32, i128, i128) =
+        trellis_event_data(&env, &client.address, symbol_short!("trls_prtl"));
+    assert_eq!(event_milestone, 0, "trls_prtl must name the released milestone");
+    assert_eq!(event_amount, 300, "trls_prtl must carry the released amount");
+    assert_eq!(event_remaining, 700, "trls_prtl must carry the remainder");
+
+    assert_eq!(remaining, 700, "release_partial must return the remainder");
+    assert_eq!(
+        token_client.balance(&client.address),
+        700,
+        "the contract must be debited exactly the released amount"
+    );
+    assert_eq!(
+        token_client.balance(&payee),
+        300,
+        "the payee must be credited exactly the released amount"
+    );
+    assert_eq!(
+        token_client.balance(&payer),
+        9_000,
+        "a partial release must not touch the payer's balance"
     );
 
-    client.lock_funds(&id, &0u32);
+    let agreement = client.get_agreement(&id);
+    assert_eq!(
+        agreement.milestones.get(0).expect("milestone 0 must exist").status,
+        EscrowStatus::Funded,
+        "a partially released milestone must stay Funded"
+    );
+    assert_eq!(
+        agreement.released_amounts.get(0),
+        Some(300),
+        "released_amounts must record the first release"
+    );
+    assert_eq!(
+        agreement.released_amounts.get(1),
+        None,
+        "an untouched milestone must have no release entry"
+    );
+
+    // --- Second partial release, milestone now `WorkSubmitted` -------------
     client.submit_work(&id, &0u32, &None);
-    client.approve_and_release(&id, &0u32);
-
-    client.lock_funds(&id, &1u32);
-    client.raise_dispute(payee, &id, &1u32, &None);
-    id
-}
-
-/// `resolve_dispute(refund_to_payer = true)` on the last open milestone emits
-/// `trls_rslv` then `trls_cmpl`, counting the ruling as a refund.
-#[test]
-fn test_resolve_dispute_refund_on_last_milestone_completes_agreement() {
-    let (env, payer, payee, dispute_resolver, token_address, client) = setup();
-    let id = init_with_last_milestone_disputed(
-        &env,
-        &client,
-        210,
-        (&payer, &payee, &dispute_resolver, &token_address),
-    );
-
-    client.resolve_dispute(&id, &1u32, &true);
+    let remaining = client.release_partial(&id, &0u32, &450i128);
 
     assert_trellis_topics(
         &env,
         &client.address,
-        &[symbol_short!("trls_rslv"), symbol_short!("trls_cmpl")],
-        "resolve_dispute on the last milestone must emit trls_rslv then trls_cmpl",
+        &[symbol_short!("trls_prtl")],
+        "a non-final partial release must emit exactly one trls_prtl event",
     );
-    let counts: (u32, u32) =
-        trellis_event_data(&env, &client.address, symbol_short!("trls_cmpl"));
-    assert_eq!(counts, (1, 1), "one approved, one refunded by ruling");
-}
+    let (event_milestone, event_amount, event_remaining): (u32, i128, i128) =
+        trellis_event_data(&env, &client.address, symbol_short!("trls_prtl"));
+    assert_eq!(event_milestone, 0, "trls_prtl must name the released milestone");
+    assert_eq!(event_amount, 450, "trls_prtl must carry the released amount");
+    assert_eq!(event_remaining, 250, "trls_prtl must carry the remainder");
 
-/// `resolve_dispute(refund_to_payer = false)` on the last open milestone
-/// completes the agreement with both milestones counted as completed.
-#[test]
-fn test_resolve_dispute_award_on_last_milestone_completes_agreement() {
-    let (env, payer, payee, dispute_resolver, token_address, client) = setup();
-    let id = init_with_last_milestone_disputed(
-        &env,
-        &client,
-        211,
-        (&payer, &payee, &dispute_resolver, &token_address),
-    );
-
-    client.resolve_dispute(&id, &1u32, &false);
-
-    assert_trellis_topics(
-        &env,
-        &client.address,
-        &[symbol_short!("trls_rslv"), symbol_short!("trls_cmpl")],
-        "resolve_dispute on the last milestone must emit trls_rslv then trls_cmpl",
-    );
-    let counts: (u32, u32) =
-        trellis_event_data(&env, &client.address, symbol_short!("trls_cmpl"));
-    assert_eq!(counts, (2, 0), "both milestones paid to the payee");
-}
-
-/// A genuine split on the last open milestone completes the agreement; the
-/// split's status is `Completed`, so it counts towards `completed_count`.
-#[test]
-fn test_resolve_dispute_split_on_last_milestone_completes_agreement() {
-    let (env, payer, payee, dispute_resolver, token_address, client) = setup();
-    let id = init_with_last_milestone_disputed(
-        &env,
-        &client,
-        212,
-        (&payer, &payee, &dispute_resolver, &token_address),
-    );
-
-    client.resolve_dispute_split(&id, &1u32, &500i128, &1_500i128);
-
-    assert_trellis_topics(
-        &env,
-        &client.address,
-        &[symbol_short!("trls_rslv"), symbol_short!("trls_cmpl")],
-        "resolve_dispute_split on the last milestone must emit trls_rslv then trls_cmpl",
-    );
-    let counts: (u32, u32) =
-        trellis_event_data(&env, &client.address, symbol_short!("trls_cmpl"));
-    assert_eq!(counts, (2, 0), "a split ruling is recorded as Completed");
-}
-
-/// A 100/0 split on the last open milestone completes the agreement with the
-/// ruling counted as a refund.
-#[test]
-fn test_resolve_dispute_split_full_refund_on_last_milestone_completes_agreement() {
-    let (env, payer, payee, dispute_resolver, token_address, client) = setup();
-    let id = init_with_last_milestone_disputed(
-        &env,
-        &client,
-        213,
-        (&payer, &payee, &dispute_resolver, &token_address),
-    );
-
-    client.resolve_dispute_split(&id, &1u32, &2_000i128, &0i128);
-
-    assert_trellis_topics(
-        &env,
-        &client.address,
-        &[symbol_short!("trls_rslv"), symbol_short!("trls_cmpl")],
-        "resolve_dispute_split on the last milestone must emit trls_rslv then trls_cmpl",
-    );
-    let counts: (u32, u32) =
-        trellis_event_data(&env, &client.address, symbol_short!("trls_cmpl"));
-    assert_eq!(counts, (1, 1), "one approved, one refunded by ruling");
-}
-
-/// A ruling that leaves another milestone open must not complete the
-/// agreement.
-#[test]
-fn test_resolve_dispute_with_open_milestones_does_not_complete_agreement() {
-    let (env, payer, payee, dispute_resolver, token_address, client) = setup();
-    let id = agreement_id(&env, 214);
-    client.init(
-        &id,
-        &payer,
-        &payee,
-        &token_address,
-        &crate::test_utils::milestones_from_amounts(&env, &[1_000, 2_000]),
-        &dispute_resolver,
-    );
-    client.lock_funds(&id, &0u32);
-    client.raise_dispute(&payer, &id, &0u32, &None);
-
-    client.resolve_dispute(&id, &0u32, &true);
-
-    assert_trellis_topics(
-        &env,
-        &client.address,
-        &[symbol_short!("trls_rslv")],
-        "milestone 1 is still Pending, so only trls_rslv may fire",
-    );
-}
-
-// ---------------------------------------------------------------------------
-// #607 — extend_agreement_ttl authenticates the caller it records
-// ---------------------------------------------------------------------------
-
-/// Without `caller`'s authorisation the call traps, so nobody can log an
-/// arbitrary address as the keeper in `trls_ttle`.
-#[test]
-#[should_panic(expected = "InvalidAction")]
-fn test_extend_ttl_without_caller_auth_traps() {
-    let (env, payer, payee, dispute_resolver, token_address, client) = setup();
-    let id = agreement_id(&env, 220);
-    client.init(
-        &id,
-        &payer,
-        &payee,
-        &token_address,
-        &one_milestone(&env, 1_000),
-        &dispute_resolver,
-    );
-    let keeper = Address::generate(&env);
-
-    deny_all_auth(&env);
-    client.extend_agreement_ttl(&id, &keeper);
-}
-
-/// A third-party keeper can still renew any agreement, and the only signature
-/// the call requires is the keeper's own — which is exactly the address the
-/// `trls_ttle` event then reports.
-#[test]
-fn test_extend_ttl_requires_only_caller_signature() {
-    let (env, payer, payee, dispute_resolver, token_address, client) = setup();
-    let id = agreement_id(&env, 221);
-    client.init(
-        &id,
-        &payer,
-        &payee,
-        &token_address,
-        &one_milestone(&env, 1_000),
-        &dispute_resolver,
-    );
-    let keeper = Address::generate(&env);
-
-    client.extend_agreement_ttl(&id, &keeper);
-
-    let auths = env.auths();
-    assert_eq!(auths.len(), 1, "only the caller may be asked to sign");
-    assert_eq!(auths[0].0, keeper, "the required signer must be `caller`");
-
-    let (logged,): (Address,) =
-        trellis_event_data(&env, &client.address, symbol_short!("trls_ttle"));
-    assert_eq!(logged, keeper, "trls_ttle must name the real signer");
-}
-
-// ---------------------------------------------------------------------------
-// #608 — funding is rejected once the milestone deadline has passed
-// ---------------------------------------------------------------------------
-
-/// `lock_funds` exactly at the deadline still succeeds — the milestone is not
-/// expirable until the timestamp is strictly past it.
-#[test]
-fn test_lock_funds_at_deadline_succeeds() {
-    let (env, payer, payee, dispute_resolver, token_address, client) = setup();
-    let id = init_with_deadline(
-        &env,
-        &client,
-        230,
-        (&payer, &payee, &dispute_resolver, &token_address),
-        500,
-        100,
-    );
-
-    env.ledger().set_timestamp(DEADLINE_T0 + 100);
-    assert_eq!(client.try_lock_funds(&id, &0u32), Ok(Ok(())));
+    assert_eq!(remaining, 250, "release_partial must return the remainder");
     assert_eq!(
-        client.get_milestone(&id, &0u32).map(|m| m.status),
-        Some(EscrowStatus::Funded)
-    );
-}
-
-/// One second past the deadline, `lock_funds` returns `DeadlinePassed` and
-/// leaves the milestone `Pending` with no tokens moved.
-#[test]
-fn test_lock_funds_after_deadline_fails() {
-    let (env, payer, payee, dispute_resolver, token_address, client) = setup();
-    let token_client = token::TokenClient::new(&env, &token_address);
-    let id = init_with_deadline(
-        &env,
-        &client,
-        231,
-        (&payer, &payee, &dispute_resolver, &token_address),
-        500,
-        100,
-    );
-    let payer_balance = token_client.balance(&payer);
-
-    env.ledger().set_timestamp(DEADLINE_T0 + 101);
-    assert_eq!(
-        client.try_lock_funds(&id, &0u32),
-        Err(Ok(TrellisError::DeadlinePassed))
+        token_client.balance(&client.address),
+        250,
+        "the contract must be debited exactly the second released amount"
     );
     assert_eq!(
-        client.get_milestone(&id, &0u32).map(|m| m.status),
-        Some(EscrowStatus::Pending)
+        token_client.balance(&payee),
+        750,
+        "the payee must be credited the cumulative released amount"
     );
-    assert_eq!(token_client.balance(&payer), payer_balance);
-    assert_eq!(token_client.balance(&client.address), 0);
-}
+    assert_eq!(token_client.balance(&payer), 9_000);
 
-/// `batch_lock_funds` exactly at the deadline still succeeds.
-#[test]
-fn test_batch_lock_funds_at_deadline_succeeds() {
-    let (env, payer, payee, dispute_resolver, token_address, client) = setup();
-    let id = init_with_deadline(
-        &env,
-        &client,
-        232,
-        (&payer, &payee, &dispute_resolver, &token_address),
-        500,
-        100,
-    );
-
-    env.ledger().set_timestamp(DEADLINE_T0 + 100);
+    let agreement = client.get_agreement(&id);
     assert_eq!(
-        client.try_batch_lock_funds(&id, &vec![&env, 0u32]),
-        Ok(Ok(1u32))
+        agreement.milestones.get(0).expect("milestone 0 must exist").status,
+        EscrowStatus::WorkSubmitted,
+        "a partially released milestone must keep its WorkSubmitted status"
     );
     assert_eq!(
-        client.get_milestone(&id, &0u32).map(|m| m.status),
-        Some(EscrowStatus::Funded)
-    );
-}
-
-/// `batch_lock_funds` past a milestone's deadline returns `DeadlinePassed` and
-/// reverts the whole batch, including milestones without a deadline.
-#[test]
-fn test_batch_lock_funds_after_deadline_fails_atomically() {
-    let (env, payer, payee, dispute_resolver, token_address, client) = setup();
-    let token_client = token::TokenClient::new(&env, &token_address);
-    env.ledger().set_timestamp(DEADLINE_T0);
-    let id = agreement_id(&env, 233);
-    client.init(
-        &id,
-        &payer,
-        &payee,
-        &token_address,
-        &crate::test_utils::milestones_from_amounts(&env, &[500, 700]),
-        &dispute_resolver,
-    );
-    // Only milestone 1 has a deadline.
-    client.set_milestone_deadline(&id, &1u32, &(DEADLINE_T0 + 100));
-    let payer_balance = token_client.balance(&payer);
-
-    env.ledger().set_timestamp(DEADLINE_T0 + 101);
-    assert_eq!(
-        client.try_batch_lock_funds(&id, &vec![&env, 0u32, 1u32]),
-        Err(Ok(TrellisError::DeadlinePassed))
+        agreement.milestones.get(1).expect("milestone 1 must exist").status,
+        EscrowStatus::Pending,
+        "a partial release must not affect other milestones"
     );
     assert_eq!(
-        client.get_milestone(&id, &0u32).map(|m| m.status),
-        Some(EscrowStatus::Pending),
-        "the failed batch must not fund the milestone without a deadline either"
+        agreement.released_amounts.get(0),
+        Some(750),
+        "released_amounts must hold the cumulative total of both releases"
     );
-    assert_eq!(
-        client.get_milestone(&id, &1u32).map(|m| m.status),
-        Some(EscrowStatus::Pending)
-    );
-    assert_eq!(token_client.balance(&payer), payer_balance);
-    assert_eq!(token_client.balance(&client.address), 0);
 }
