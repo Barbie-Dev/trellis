@@ -203,6 +203,17 @@ trellis --as payer init \
 trellis status --agreement-id <hex>
 ```
 
+### Check an agreement's total value
+
+```bash
+trellis total-amount --agreement-id <hex>
+```
+
+> Read-only; no signature or confirmation needed. Returns the sum of all
+> milestone amounts (an `i128` in the token's base unit, printed as a quoted
+> string). The frontend's agreement status page shows the same value as
+> **Total** in the Milestones header.
+
 ### Fund a milestone
 
 ```bash
@@ -210,6 +221,18 @@ trellis --as payer lock-funds --agreement-id <hex> --milestone-id 0
 ```
 
 > Must be signed by the payer identity (`--as payer`)
+
+### Fund several milestones at once
+
+```bash
+trellis batch-lock-funds --agreement-id <hex> --milestone-ids "0,1,2"
+```
+
+> Must be signed by the payer identity. The batch is atomic: if any listed
+> milestone is out of range or not `Pending`, the whole transaction reverts and
+> no tokens move. `--milestone-ids` takes comma-separated zero-based indices;
+> empty input, empty fields (`"0,,1"`), non-integers and duplicate IDs are
+> rejected by the CLI before anything is submitted.
 
 ### Submit work proof
 
@@ -272,6 +295,16 @@ trellis --as payer cancel-milestone --agreement-id <hex> --milestone-id 0
 
 > Must be signed by the payer (`--as payer`). Only works on milestones still in `Pending` status.
 
+### Extend an agreement's ledger TTL
+
+```bash
+trellis extend-ttl --agreement-id <hex> --caller <your G... address>
+```
+
+> Any address may call this — no party signature is required — but the source
+> account pays the rent. `--caller` is recorded in the `ttl_extended` event;
+> pass the source key's public address. Prompts for confirmation unless
+> `--yes` is given.
 ### Check RPC connectivity
 
 ```bash
@@ -335,6 +368,28 @@ trellis status --agreement-id 01010101010101010101010101010101010101010101010101
 
 ---
 
+## Mainnet Deployment
+
+Everything above is testnet-only. A mainnet deployment moves real funds and some decisions cannot be undone, so add these precautions:
+
+- **Key management:** use a dedicated hardware-backed or offline-generated deployer identity (`stellar keys add trellis-mainnet-deployer --seed-phrase` / ledger). Never reuse testnet keys, never store the secret in `.env`, CI variables, or shell history.
+- **Review gates:** deploy only a WASM built from a tagged, reviewed release (see "Verifying Release Artifacts"); compare its sha256 against the release attestation. `make deploy-mainnet` prints the hash and requires typing `mainnet` to confirm.
+- **Irreversibility:** `init` parameters and any upgrade/admin decisions are permanent once submitted. Dry-run the full flow on testnet first, and confirm the admin and fee settings with a second reviewer before submitting.
+- **Config:** start from `frontend/.env.mainnet.example`; the CLI uses `--network mainnet`.
+
+```bash
+make build-contract
+make deploy-mainnet MAINNET_IDENTITY=trellis-mainnet-deployer
+```
+
+### CI approval gate
+
+`.github/workflows/deploy-mainnet.yml` is the manual, `environment: mainnet`-gated deploy workflow.
+
+Any workflow that targets mainnet must declare `environment: mainnet`. In **Settings → Environments → New environment → `mainnet`**, enable *Required reviewers* (at least two maintainers), restrict deployment to tags/`master`, and store mainnet secrets only as environment secrets. Jobs then pause until a reviewer manually approves.
+
+---
+
 ## Testnet Reset
 
 Stellar's testnet is periodically reset, wiping all deployed contract
@@ -344,6 +399,32 @@ agreement ID in [Verified Test Agreement](#verified-test-agreement) both stop
 resolving.
 
 ### How to tell testnet was reset
+
+A scheduled workflow checks this for you. [`Testnet Health`](.github/workflows/testnet-health.yml)
+runs daily (07:00 UTC, or on demand via **Actions → Testnet Health → Run
+workflow**) and calls `trellis status` against the
+[Live Contract](#live-contract) and [Verified Test Agreement](#verified-test-agreement):
+
+- **Reset detected** — the contract or agreement no longer exists on-chain
+  (e.g. `Error(Contract, #3)` / `AgreementNotFound`, or a missing contract
+  instance). The workflow opens an issue labelled `testnet-reset`, or comments
+  on the existing open one, and the run fails. Check for that issue before
+  debugging "agreement not found" yourself.
+- **Inconclusive** — the probe failed for another reason (RPC outage,
+  Friendbot down, build failure). The run fails so it is visible, but no issue
+  is filed, so a flaky RPC never raises a false reset alarm.
+- **Healthy** — any open `testnet-reset` issue is closed automatically.
+
+Each run's probe output is in its job summary. The same check runs locally:
+
+```bash
+TRELLIS_CONTRACT_ID=<contract ID> TRELLIS_SOURCE_KEY=<identity> \
+  TRELLIS_BIN=target/release/trellis ./scripts/check-testnet-health.sh [agreement ID]
+```
+
+It exits `0` (healthy), `10` (reset suspected) or `1` (inconclusive).
+
+Signs you can check manually:
 
 - `trellis status --agreement-id <any known ID>` returns `agreement not found`
   even though the ID was previously valid.
@@ -429,18 +510,75 @@ does not already exist.
 
 ---
 
+## Agreement TTL Keeper
+
+Soroban archives persistent entries whose TTL runs out. Every state-mutating
+call renews an agreement's TTL to ~30 days, but an agreement that sits idle
+longer than that (a long delivery window, a stalled dispute) needs
+`extend_agreement_ttl` called on it. The repo ships a minimal keeper for this:
+
+- [`scripts/ttl-keeper.sh`](scripts/ttl-keeper.sh) runs
+  `trellis extend-ttl --yes` for every agreement listed in
+  [`.github/keeper-agreements.txt`](.github/keeper-agreements.txt) (or in
+  `TRELLIS_KEEPER_AGREEMENT_IDS`, comma-separated, when set). It attempts every
+  agreement and exits non-zero if any failed.
+- [`.github/workflows/ttl-keeper.yml`](.github/workflows/ttl-keeper.yml) runs
+  the script weekly (Wednesdays 05:00 UTC) and on manual dispatch, where an
+  `agreement_ids` input can override the file for a one-off run. The run's
+  output is written to the job summary.
+
+**Setup (maintainers).** The workflow is skipped until these are configured
+in the repository settings:
+
+| Name | Kind | Value |
+|---|---|---|
+| `TRELLIS_KEEPER_SECRET_KEY` | Secret | `S…` secret key of a funded testnet account that pays the rent |
+| `TRELLIS_KEEPER_ADDRESS` | Variable | The matching `G…` public address (recorded as `caller`; the contract requires it to sign, so it must match the secret key) |
+| `TRELLIS_CONTRACT_ID` | Variable (optional) | Contract to target; defaults to the [Live Contract](#live-contract) |
+
+Use a dedicated low-balance account — never a payer, payee or resolver key.
+
+**Running it locally / as a cron job:**
+
+```bash
+export TRELLIS_CONTRACT_ID="<contract ID>"
+export TRELLIS_SOURCE_KEY="<funded identity name>"
+export TRELLIS_KEEPER_CALLER="$(stellar keys address <funded identity name>)"
+TRELLIS_BIN=target/release/trellis ./scripts/ttl-keeper.sh
+```
+
+**Assumptions and limitations.** This is a stopgap, not a production keeper
+network:
+
+- It only renews agreements someone has added to the tracked list — there is
+  no on-chain discovery, so new long-lived agreements must be added by PR.
+- It depends on GitHub's scheduler (runs can be delayed, and scheduled
+  workflows are disabled after 60 days without repository activity) and on a
+  single funded key. If that key runs out of XLM, every extension fails.
+- A failed run is visible only as a failed workflow run; nothing pages anyone.
+  The weekly cadence leaves roughly three missed runs of headroom before a
+  30-day TTL lapses.
+- After a [Testnet Reset](#testnet-reset) the listed IDs no longer exist and
+  every extension fails with `agreement not found` until the list (and
+  `TRELLIS_CONTRACT_ID`) is updated.
+
+---
+
 ## Verified CLI Commands
 
 | Command | Status | Notes |
 |---|---|---|
 | `init` | ✅ Verified on testnet | Agreement created on-chain |
 | `status` | ✅ Verified on testnet | Returns full agreement state as JSON |
+| `total-amount` | ✅ Implemented | Returns the agreement's total value via `get_total_amount` (Issue #492) |
 | `lock-funds` | ✅ Verified on testnet | Funds successfully locked in escrow (Issue #7) |
+| `batch-lock-funds` | ✅ Implemented | Atomically funds multiple milestones in one transaction (Issue #493) |
 | `submit-work` | ✅ Verified on testnet | Work proof submitted and milestone transitioned to WorkSubmitted (Issue #8) |
 | `approve-release` | ✅ Verified on testnet | Funds released to payee, milestone marked Completed (Issue #8) |
 | `raise-dispute` | ✅ Verified on testnet | Dispute raised and milestone transitioned to Disputed (Issue #9) |
 | `resolve-dispute` | ✅ Verified on testnet (both paths) | Resolves to both Refunded (payer) and Completed (payee) states (Issue #9) |
 | `cancel-milestone` | ✅ Implemented | Cancels unfunded milestones |
+| `extend-ttl` | ✅ Implemented | Renews an agreement's ledger TTL; used by the TTL keeper (Issue #494) |
 
 ---
 
